@@ -5,4 +5,4 @@ services:
     env: python
     plan: free
     buildCommand: ""
-    startCommand: "MoneyFarmerAT_Bot.py"
+    startCommand: "MoneyFarmerAT_bot.py"
