@@ -5,6 +5,7 @@ import time
 import json
 import logging
 import threading
+import requests
 from collections import deque
 
 import pandas as pd
@@ -82,11 +83,9 @@ def place_order(symbol: str):
         return None
 
 def exit_order(symbol: str):
+    """Piazza MARKET SELL reduce_only e notifica Telegram."""
     if _open_orders[symbol] == 0:
         return None
-    # dopo aver chiuso con successo:
-    _open_orders[symbol] -= 1
-    ```
 
     try:
         resp = bybit.place_active_order(
@@ -104,7 +103,7 @@ def exit_order(symbol: str):
             f"Pair: {symbol}\n"
             f"Qty: {ORDER_QTY}\n"
             f"Order ID: `{oid}`\n"
-            f"Pyramiding rimanente: {_open_orders[symbol]}/2"
+            f"Pyramiding rimanente: {_open_orders[symbol]}/{MAX_PYRAMID}"
         )
         telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
         logging.info(f"✅ EXIT per {symbol}, order_id {oid}")
@@ -117,6 +116,7 @@ def exit_order(symbol: str):
             text=f"❌ Errore exit {symbol}: {e}"
         )
         return None
+
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA50"] = ta.ema(df["close"], length=50)
@@ -152,23 +152,25 @@ def on_kline(symbol, ts, open_p, high_p, low_p, close_p):
     buf = buffers[symbol]
     buf.append({"open": open_p, "high": high_p, "low": low_p, "close": close_p})
     if len(buf) < HISTORY_LIMIT:
-    return
+      return
 
     df = pd.DataFrame(list(buf))
     df = calculate_indicators(df)
 
     # ENTRY: se <2 posizioni aperte e condizione TRUE
-    if _open_orders[symbol] < 2 and generate_signal(df):
+    pos = bybit.get_position(symbol=symbol)["result"][0]
+    entry_price[symbol] = float(pos["entry_price"])
+    if _open_orders[symbol] < MAX_PYRAMID and generate_signal(df):
         oid = place_order(symbol)
         if oid:
             conf = random_confidence()
             logging.info(f"📈 {symbol} LONG confermato (conf {conf}%)")
-    tp_level = entry_price[symbol] + TAKE_PROFIT_ATR * df["ATR"].iloc[-1]
-       if close_p >= tp_level:
-            _exit_reason = "TP"
-    sl_level = entry_price[symbol] - STOP_LOSS_ATR * df["ATR"].iloc[-1]
-       if close_p <= sl_level:
-            _exit_reason = "SL"
+            tp_level = entry_price[symbol] + TAKE_PROFIT_ATR * df["ATR"].iloc[-1]
+            if close_p >= tp_level:
+              _exit_reason = "TP"
+           sl_level = entry_price[symbol] - STOP_LOSS_ATR * df["ATR"].iloc[-1]
+           if close_p <= sl_level:
+              _exit_reason = "SL"
   
 
      oid = exit_order(symbol)
