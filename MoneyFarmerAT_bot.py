@@ -1,195 +1,212 @@
-import logging
-import random
+# main.py
+
 import os
+import time
 import json
+import logging
 import threading
-from datetime import datetime
+from collections import deque
 
 import pandas as pd
 import pandas_ta as ta
-import websocket
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes,CallbackQueryHandler
+from websocket import WebSocketApp
+from pybit import inverse_perpetual
+from telegram import Bot
 
-# === CONFIG ===
-//BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = "-4655187396"  # ID del gruppo o chat in cui inviare i messaggi
+# === CONFIGURAZIONE ===
+BOT_TOKEN     = os.getenv("BOT_TOKEN")
+CHAT_ID       = os.getenv("CHAT_ID", "-4655187396")
 
-# === LOGGING SETUP ===
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+BYBIT_KEY     = os.getenv("BYBIT_API_KEY")
+BYBIT_SECRET  = os.getenv("BYBIT_API_SECRET")
+ORDER_QTY     = float(os.getenv("ORDER_QUANTITY", "0.001"))
+
+PAIRS         = ["BTCUSD", "XRPUSD", "SOLUSD", "TAOUSD"]
+TIMEFRAME     = "3"      # minuti
+HISTORY_LIMIT = 200      # candele in memoria
+
+# === ISTANZE CLIENT ===
+telegram_bot = Bot(token=BOT_TOKEN)
+bybit        = inverse_perpetual.HTTP(
+    endpoint="https://api.bybit.com",
+    api_key=BYBIT_KEY,
+    api_secret=BYBIT_SECRET
 )
 
-# === ISTANZA DEL BOT ===
-bot = Bot(token=BOT_TOKEN)
+# tiene traccia di quante entry aperte per simbolo (max 2)
+_open_orders = { symbol: 0 for symbol in PAIRS }
 
-# === COPPIE E STORAGE PREZZI + PYRAMID COUNTER ===
-pairs = ["BTCUSD", "TAOUSD", "SOLUSD", "XRPUSD"]
-close_prices = {p: [] for p in pairs}
-high_prices  = {p: [] for p in pairs}
-low_prices   = {p: [] for p in pairs}
-entry_count  = {p: 0  for p in pairs}  # contatore pyramiding (max 2 entrate)
+def place_order(symbol: str):
+    """Piazza MARKET BUY con leva 8× e notifica Telegram."""
+    # pyramiding = 2
+    if _open_orders[symbol] >= 2:
+        logging.info(f"{symbol}: raggiunto pyramiding massimo (2), skip")
+        return None
 
-# === CALCOLO INDICATORI ===
+    # assicura leva 8×
+    bybit.set_leverage(symbol=symbol, buy_leverage=8, sell_leverage=8)
+
+    try:
+        resp = bybit.place_active_order(
+            symbol=symbol,
+            side="Buy",
+            order_type="Market",
+            qty=ORDER_QTY,
+            time_in_force="GoodTillCancel"
+        )
+        oid = resp["result"]["order_id"]
+        _open_orders[symbol] += 1
+        msg = (
+            f"🚀 *Entry Executed*\n"
+            f"Pair: {symbol}\n"
+            f"Qty: {ORDER_QTY}\n"
+            f"Order ID: `{oid}`\n"
+            f"Pyramiding: {_open_orders[symbol]}/2"
+        )
+        telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        logging.info(f"✅ ENTRY #{_open_orders[symbol]} per {symbol}, order_id {oid}")
+        return oid
+
+    except Exception as e:
+        logging.error(f"❌ Errore entry {symbol}: {e}")
+        telegram_bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"❌ Errore entry {symbol}: {e}"
+        )
+        return None
+
+def exit_order(symbol: str):
+    """Piazza MARKET SELL reduce_only e notifica Telegram."""
+    if _open_orders[symbol] == 0:
+        return None
+
+    try:
+        resp = bybit.place_active_order(
+            symbol=symbol,
+            side="Sell",
+            order_type="Market",
+            qty=ORDER_QTY,
+            time_in_force="GoodTillCancel",
+            reduce_only=True
+        )
+        oid = resp["result"]["order_id"]
+        _open_orders[symbol] -= 1
+        msg = (
+            f"🏁 *Exit Executed*\n"
+            f"Pair: {symbol}\n"
+            f"Qty: {ORDER_QTY}\n"
+            f"Order ID: `{oid}`\n"
+            f"Pyramiding rimanente: {_open_orders[symbol]}/2"
+        )
+        telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        logging.info(f"✅ EXIT per {symbol}, order_id {oid}")
+        return oid
+
+    except Exception as e:
+        logging.error(f"❌ Errore exit {symbol}: {e}")
+        telegram_bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"❌ Errore exit {symbol}: {e}"
+        )
+        return None
+
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df['EMA50'] = ta.ema(df['close'], length=50)
-    df['EMA21'] = ta.ema(df['close'], length=21)
-    df['EMA34'] = ta.ema(df['close'], length=34)
-    df['ATR']   = ta.atr(df['high'], df['low'], df['close'], length=14)
-    # ADX restituisce un DataFrame con colonna 'ADX_14'
-    df['ADX']   = ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14']
+    df["EMA50"] = ta.ema(df["close"], length=50)
+    df["EMA21"] = ta.ema(df["close"], length=21)
+    df["EMA34"] = ta.ema(df["close"], length=34)
+    df["ATR"]   = ta.atr(df["high"], df["low"], df["close"], length=14)
+    df["ADX"]   = ta.adx(df["high"], df["low"], df["close"], length=14)["ADX_14"]
     return df
 
-# === GENERAZIONE SEGNALE ===
-def generate_signal(df: pd.DataFrame, pair: str):
-    # non abbastanza barre per sweep?
+def generate_signal(df: pd.DataFrame) -> bool:
     if len(df) < 3:
-        return "No Signal", 0
-
-    last = df.iloc[-1]
-    recent_low = df['low'].iloc[-2:].min()
-
-    # sweep su chiusure delle due barre precedenti
-    prev_closes = df['close'].iloc[-3:-1]
-    sweep_2bar  = last['close'] > prev_closes.max()
-
-    long_condition = (
-        last['close'] > recent_low and
-        sweep_2bar and
-        last['close'] > last['EMA50'] and
-        last['ADX'] > 10 and
-        last['ATR'] > df['ATR'].rolling(20).mean().iloc[-1] and
-        (5 <= last.name.hour < 22)
+        return False
+    last       = df.iloc[-1]
+    recent_low = df["low"].iloc[-2:].min()
+    prev_high  = df["high"].shift(1).iloc[-2:].max()
+    sweep      = last["close"] > prev_high
+    cond = (
+        (last["close"] > recent_low) and
+        sweep and
+        (last["close"] > last["EMA50"]) and
+        (last["ADX"] > 10) and
+        (last["ATR"] > df["ATR"].rolling(20).mean().iloc[-1])
     )
+    return bool(cond)
 
-    if long_condition:
-        confidence = round(random.uniform(85, 95), 2)
-        return "Bullish", confidence
-    return "No Signal", 0
+def random_confidence() -> float:
+    return round(random.uniform(85, 95), 2)
 
-# === PROCESSAMENTO DATI DAL WEBSOCKET ===
-def process_data(pair, close_p, high_p, low_p):
-    # 1) Append dei prezzi
-    arr_c = close_prices[pair]
-    arr_h = high_prices[pair]
-    arr_l = low_prices[pair]
-    arr_c.append(close_p)
-    arr_h.append(high_p)
-    arr_l.append(low_p)
+# Rolling storage per ogni pair
+buffers = { p: deque(maxlen=HISTORY_LIMIT) for p in PAIRS }
 
-    # 2) Mantieni solo ultimi 100
-    if len(arr_c) > 100:
-        arr_c.pop(0)
-        arr_h.pop(0)
-        arr_l.pop(0)
+def on_kline(symbol, ts, open_p, high_p, low_p, close_p):
+    buf = buffers[symbol]
+    buf.append({"open": open_p, "high": high_p, "low": low_p, "close": close_p})
+    if len(buf) < HISTORY_LIMIT:
+        return
 
-    # 3) Costruisci il DataFrame con indice temporale fittizio
-    df = pd.DataFrame({
-        'close': arr_c,
-        'high':  arr_h,
-        'low':   arr_l
-    }, index=pd.to_datetime([datetime.utcnow() for _ in arr_c])).astype(float)
-
-    # 4) Calcola indicatori
+    df = pd.DataFrame(list(buf))
     df = calculate_indicators(df)
 
-    # 5) Genera segnale e gestisci pyramiding
-    signal, conf = generate_signal(df, pair)
-    if signal == "Bullish" and entry_count[pair] < 2:
-        entry_count[pair] += 1
+    # ENTRY: se <2 posizioni aperte e condizione TRUE
+    if _open_orders[symbol] < 2 and generate_signal(df):
+        oid = place_order(symbol)
+        if oid:
+            conf = random_confidence()
+            logging.info(f"📈 {symbol} LONG confermato (conf {conf}%)")
 
-        text = (
-            f"🐂 *Bullish Trend Detected*\n"
-            f"🤖 Confidence AI: {conf}%\n"
-            f"📊 Pair: {pair}\n"
-            "⏱ Timeframe: 2m\n\n"
-            "👉 Vuoi eseguire l’operazione?"
-        )
-        keyboard = [
-            [InlineKeyboardButton("✅ Conferma LONG", callback_data=f"confirm_long|{pair}|{conf}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    elif signal != "Bullish":
-        # reset pyramiding se non bullish
-        entry_count[pair] = 0
+    # EXIT placeholder: qui inserirai stop-loss / take-profit
+    # es.:
+    # if _open_orders[symbol] > 0 and exit_condition(df):
+    #     exit_order(symbol)
 
-# === CALLBACK del WebSocket ===
-def on_message(ws, message):
-    msg = json.loads(message)
-    topic = msg.get("topic", "")
-    if topic.startswith("candle"):
-        for d in msg.get("data", []):
-            p      = d["symbol"]
-            close_ = float(d["close"])
-            high_  = float(d["high"])
-            low_   = float(d["low"])
-            process_data(p, close_, high_, low_)
-
-def on_open(ws):
-    logging.info("✅ Connessione aperta al WS Bybit")
-    subscribe = {
-        "op": "subscribe",
-        "args": [f"candle.3.{p}" for p in pairs]
-    }
-    ws.send(json.dumps(subscribe))
-    logging.info(f"📡 Sottoscritto a candles 3m: {pairs}")
-
-def on_error(ws, error):
-    logging.error("WebSocket error: %s", error)
-
-def on_close(ws, code, reason):
-    logging.info("WebSocket closed: %s %s", code, reason)
-
-# === HANDLER TELEGRAM ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = (
-        "🎉 Benvenuto in GoldenBullX! 🎉\n"
-        "Rimani in attesa dei segnali di trading in tempo reale su BTC, ETH e SOL.\n"
-        "I segnali verranno inviati automaticamente quando la strategia rileva un trend bullish."
-    )
-    await update.message.reply_text(welcome)
-    logging.info(f"/start ricevuto da {update.effective_user.id}")
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, pair, conf = q.data.split("|")
-    user = q.from_user.first_name
-    await q.edit_message_text(
-        f"✅ LONG *{pair}* confermato da {user} (confidenza {conf}%)",
-        parse_mode="Markdown"
-    )
-    logging.info(f"{user} ha confermato LONG {pair} @ {conf}%")
-
-# === MAIN ===
-if __name__ == "__main__":
-    # 1) Avvio WS in background
-    threading.Thread(
-        target=lambda: websocket.WebSocketApp(
+class BybitStreamer:
+    def __init__(self, cb):
+        self.on_kline = cb
+        self.ws = WebSocketApp(
             "wss://stream.bybit.com/v5/public/inverse",
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        ).run_forever(
-            ping_interval=20,
-            ping_timeout=10,
-            reconnect=True
-        ),
-        daemon=True
-    ).start()
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+    def _on_open(self, ws):
+        args = [f"candle.{TIMEFRAME}.{p}" for p in PAIRS]
+        ws.send(json.dumps({"op":"subscribe","args": args}))
+        logging.info("🔗 WS sottoscritto a: " + ", ".join(args))
+    def _on_message(self, ws, msg):
+        m = json.loads(msg)
+        if m.get("topic","").startswith("candle"):
+            for d in m["data"]:
+                k = d["k"]
+                self.on_kline(
+                    symbol=d["symbol"],
+                    ts=k["t"],
+                    open_p=float(k["o"]),
+                    high_p=float(k["h"]),
+                    low_p=float(k["l"]),
+                    close_p=float(k["c"])
+                )
+    def _on_error(self, ws, err):
+        logging.error(f"WS error: {err}")
+    def _on_close(self, ws, code, reason):
+        logging.info(f"WS closed: {code} {reason}")
+    def start(self):
+        threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
-    # 2) Avvio bot Telegram
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
+if __name__ == "__main__":
+    # log e leva 8× per tutti i pairs
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(message)s",
+        level=logging.INFO
+    )
+    for sym in PAIRS:
+        bybit.set_leverage(sym, buy_leverage=8, sell_leverage=8)
+        logging.info(f"{sym}: leverage impostata a 8×")
 
-    logging.info("🤖 GoldenBullX Worker attivo.")
-    app.run_polling()
+    streamer = BybitStreamer(on_kline)
+    streamer.start()
+    logging.info("🤖 Bot live su " + ", ".join(PAIRS))
+    while True:
+        time.sleep(60)
