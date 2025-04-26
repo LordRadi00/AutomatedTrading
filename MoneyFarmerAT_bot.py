@@ -13,6 +13,12 @@ from websocket import WebSocketApp
 from pybit import inverse_perpetual
 from telegram import Bot
 
+TAKE_PROFIT_ATR = 4
+STOP_LOSS_ATR   = 2
+MAX_PYRAMID = 2
+
+
+
 # === CONFIGURAZIONE ===
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_ID       = os.getenv("CHAT_ID", "-4655187396")
@@ -33,14 +39,14 @@ bybit        = inverse_perpetual.HTTP(
     api_secret=BYBIT_SECRET
 )
 
-# tiene traccia di quante entry aperte per simbolo (max 2)
+# tiene traccia di quante entry aperte per simbolo (max 2 per simbolo)
 _open_orders = { symbol: 0 for symbol in PAIRS }
+entry_price = { s: None for s in PAIRS }
 
 def place_order(symbol: str):
-    """Piazza MARKET BUY con leva 8× e notifica Telegram."""
-    # pyramiding = 2
-    if _open_orders[symbol] >= 2:
-        logging.info(f"{symbol}: raggiunto pyramiding massimo (2), skip")
+    # se ho già MAX_PYRAMID entrate per questa coppia, skip
+    if _open_orders[symbol] >= MAX_PYRAMID:
+        logging.info(f"{symbol}: già aperte {_open_orders[symbol]} posizioni, skip")
         return None
 
     # assicura leva 8×
@@ -76,9 +82,11 @@ def place_order(symbol: str):
         return None
 
 def exit_order(symbol: str):
-    """Piazza MARKET SELL reduce_only e notifica Telegram."""
     if _open_orders[symbol] == 0:
         return None
+    # dopo aver chiuso con successo:
+    _open_orders[symbol] -= 1
+    ```
 
     try:
         resp = bybit.place_active_order(
@@ -144,7 +152,7 @@ def on_kline(symbol, ts, open_p, high_p, low_p, close_p):
     buf = buffers[symbol]
     buf.append({"open": open_p, "high": high_p, "low": low_p, "close": close_p})
     if len(buf) < HISTORY_LIMIT:
-        return
+    return
 
     df = pd.DataFrame(list(buf))
     df = calculate_indicators(df)
@@ -155,11 +163,38 @@ def on_kline(symbol, ts, open_p, high_p, low_p, close_p):
         if oid:
             conf = random_confidence()
             logging.info(f"📈 {symbol} LONG confermato (conf {conf}%)")
+    tp_level = entry_price[symbol] + TAKE_PROFIT_ATR * df["ATR"].iloc[-1]
+       if close_p >= tp_level:
+            _exit_reason = "TP"
+    sl_level = entry_price[symbol] - STOP_LOSS_ATR * df["ATR"].iloc[-1]
+       if close_p <= sl_level:
+            _exit_reason = "SL"
+  
 
-    # EXIT placeholder: qui inserirai stop-loss / take-profit
-    # es.:
-    # if _open_orders[symbol] > 0 and exit_condition(df):
-    #     exit_order(symbol)
+     oid = exit_order(symbol)
+    if oid:
+      exit_px = close_p
+      qty     = ORDER_QTY
+      pnl_usd = (exit_px - entry_price[symbol]) * qty
+    # Se vuoi in EUR, converti con un’API:
+      eur_rate = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=EUR") \
+                      .json()["rates"]["EUR"]
+      pnl_eur  = pnl_usd * eur_rate
+    # notifica Telegram
+      telegram_bot.send_message(
+          chat_id=CHAT_ID,
+          text=(
+            f"🏁 Trade Closed ({_exit_reason})\n"
+            f"Pair: {symbol}\n"
+            f"Entry: {entry_price[symbol]:.2f} USD\n"
+            f"Exit: {exit_px:.2f} USD\n"
+            f"PnL: {pnl_usd:.2f} USD / {pnl_eur:.2f} EUR"
+          ),
+          parse_mode="Markdown"
+      )
+      # resetta lo stato
+      entry_price[symbol] = None
+
 
 class BybitStreamer:
     def __init__(self, cb):
