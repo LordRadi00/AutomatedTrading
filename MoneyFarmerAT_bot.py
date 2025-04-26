@@ -45,69 +45,57 @@ _open_orders = { symbol: 0 for symbol in PAIRS }
 entry_price = { s: None for s in PAIRS }
 
 def place_order(symbol: str):
-    # se ho già MAX_PYRAMID entrate per questa coppia, skip
     if _open_orders[symbol] >= MAX_PYRAMID:
         logging.info(f"{symbol}: già aperte {_open_orders[symbol]} posizioni, skip")
         return None
 
-    # assicura leva 8×
     bybit.set_leverage(symbol=symbol, buy_leverage=8, sell_leverage=8)
-
     try:
         resp = bybit.place_active_order(
-            symbol=symbol,
-            side="Buy",
-            order_type="Market",
-            qty=ORDER_QTY,
-            time_in_force="GoodTillCancel"
+            symbol=symbol, side="Buy", order_type="Market",
+            qty=ORDER_QTY, time_in_force="GoodTillCancel"
         )
         oid = resp["result"]["order_id"]
         _open_orders[symbol] += 1
+        # registra prezzo di entrata
+        pos = bybit.get_position(symbol=symbol)["result"][0]
+        entry_price[symbol] = float(pos["entry_price"])
         msg = (
             f"🚀 *Entry Executed*\n"
-            f"Pair: {symbol}\n"
-            f"Qty: {ORDER_QTY}\n"
+            f"Pair: {symbol}\nQty: {ORDER_QTY}\n"
+            f"Price: {entry_price[symbol]:.2f} USD\n"
             f"Order ID: `{oid}`\n"
-            f"Pyramiding: {_open_orders[symbol]}/2"
+            f"Pyramiding: {_open_orders[symbol]}/{MAX_PYRAMID}"
         )
         telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-        logging.info(f"✅ ENTRY #{_open_orders[symbol]} per {symbol}, order_id {oid}")
         return oid
-
     except Exception as e:
         logging.error(f"❌ Errore entry {symbol}: {e}")
-        telegram_bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"❌ Errore entry {symbol}: {e}"
-        )
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"❌ Errore entry {symbol}: {e}")
         return None
 
 def exit_order(symbol: str):
-    """Piazza MARKET SELL reduce_only e notifica Telegram."""
     if _open_orders[symbol] == 0:
         return None
-
     try:
         resp = bybit.place_active_order(
-            symbol=symbol,
-            side="Sell",
-            order_type="Market",
-            qty=ORDER_QTY,
-            time_in_force="GoodTillCancel",
-            reduce_only=True
+            symbol=symbol, side="Sell", order_type="Market",
+            qty=ORDER_QTY, time_in_force="GoodTillCancel", reduce_only=True
         )
         oid = resp["result"]["order_id"]
         _open_orders[symbol] -= 1
         msg = (
             f"🏁 *Exit Executed*\n"
-            f"Pair: {symbol}\n"
-            f"Qty: {ORDER_QTY}\n"
+            f"Pair: {symbol}\nQty: {ORDER_QTY}\n"
             f"Order ID: `{oid}`\n"
             f"Pyramiding rimanente: {_open_orders[symbol]}/{MAX_PYRAMID}"
         )
         telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-        logging.info(f"✅ EXIT per {symbol}, order_id {oid}")
         return oid
+    except Exception as e:
+        logging.error(f"❌ Errore exit {symbol}: {e}")
+        telegram_bot.send_message(chat_id=CHAT_ID, text=f"❌ Errore exit {symbol}: {e}")
+        return None
 
     except Exception as e:
         logging.error(f"❌ Errore exit {symbol}: {e}")
@@ -152,50 +140,57 @@ def on_kline(symbol, ts, open_p, high_p, low_p, close_p):
     buf = buffers[symbol]
     buf.append({"open": open_p, "high": high_p, "low": low_p, "close": close_p})
     if len(buf) < HISTORY_LIMIT:
-      return
+    return
 
     df = pd.DataFrame(list(buf))
     df = calculate_indicators(df)
+    atr = df["ATR"].iloc[-1]
 
-    # ENTRY: se <2 posizioni aperte e condizione TRUE
-    pos = bybit.get_position(symbol=symbol)["result"][0]
-    entry_price[symbol] = float(pos["entry_price"])
+    # --- ENTRY: se <MAX_PYRAMID posizioni aperte e condizione TRUE
     if _open_orders[symbol] < MAX_PYRAMID and generate_signal(df):
         oid = place_order(symbol)
         if oid:
             conf = random_confidence()
             logging.info(f"📈 {symbol} LONG confermato (conf {conf}%)")
-            tp_level = entry_price[symbol] + TAKE_PROFIT_ATR * df["ATR"].iloc[-1]
-            if close_p >= tp_level:
-              _exit_reason = "TP"
-           sl_level = entry_price[symbol] - STOP_LOSS_ATR * df["ATR"].iloc[-1]
-           if close_p <= sl_level:
-              _exit_reason = "SL"
-  
+            # entry_price è impostato dentro place_order()
 
-     oid = exit_order(symbol)
-    if oid:
-      exit_px = close_p
-      qty     = ORDER_QTY
-      pnl_usd = (exit_px - entry_price[symbol]) * qty
-    # Se vuoi in EUR, converti con un’API:
-      eur_rate = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=EUR") \
-                      .json()["rates"]["EUR"]
-      pnl_eur  = pnl_usd * eur_rate
-    # notifica Telegram
-      telegram_bot.send_message(
-          chat_id=CHAT_ID,
-          text=(
-            f"🏁 Trade Closed ({_exit_reason})\n"
-            f"Pair: {symbol}\n"
-            f"Entry: {entry_price[symbol]:.2f} USD\n"
-            f"Exit: {exit_px:.2f} USD\n"
-            f"PnL: {pnl_usd:.2f} USD / {pnl_eur:.2f} EUR"
-          ),
-          parse_mode="Markdown"
-      )
-      # resetta lo stato
-      entry_price[symbol] = None
+    # --- EXIT: check TP / SL solo se ho almeno 1 posizione aperta
+    if _open_orders[symbol] > 0 and entry_price[symbol] is not None:
+        tp_level = entry_price[symbol] + TAKE_PROFIT_ATR * atr
+        sl_level = entry_price[symbol] - STOP_LOSS_ATR   * atr
+        exit_reason = None
+
+        if close_p >= tp_level:
+            exit_reason = "TP"
+        elif close_p <= sl_level:
+            exit_reason = "SL"
+
+        if exit_reason:
+            oid = exit_order(symbol)
+            if oid:
+                exit_px = close_p
+                qty     = ORDER_QTY
+                pnl_usd = (exit_px - entry_price[symbol]) * qty
+                # converti in EUR: serve import requests
+                eur_rate = requests.get(
+                    "https://api.exchangerate.host/latest?base=USD&symbols=EUR"
+                ).json()["rates"]["EUR"]
+                pnl_eur = pnl_usd * eur_rate
+                entry_price[symbol] = None
+
+                telegram_bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"🏁 Trade Closed ({exit_reason})\n"
+                        f"Pair: {symbol}\n"
+                        f"Entry: {entry_price[symbol]:.2f} USD\n"
+                        f"Exit: {exit_px:.2f} USD\n"
+                        f"PnL: {pnl_usd:.2f} USD / {pnl_eur:.2f} EUR"
+                    ),
+                    parse_mode="Markdown"
+                )
+                entry_price[symbol] = None
+
 
 
 class BybitStreamer:
