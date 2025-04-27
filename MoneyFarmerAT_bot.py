@@ -1,246 +1,194 @@
-# main.py
-
+# bybit_auto_trading_pro.py
 import os
 import time
-import json
-import logging
-import threading
-import requests
-from collections import deque
-
+import base64
+import h5py
+import pickle
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
-from websocket import WebSocketApp
-from pybit import inverse_perpetual
-from telegram import Bot
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from pybit.unified_trading import HTTP
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import talib
 
-# === PARAMETRI STRATEGIA ===
-TAKE_PROFIT_ATR = 4
-STOP_LOSS_ATR   = 2
-MAX_PYRAMID     = 2
+# 1. Configurazione Bybit
+API_KEY = "your_api_key"
+API_SECRET = "your_api_secret"
+SYMBOL = "BTCUSDT"
+TIMEFRAME = 15  # minuti
+ACCOUNT_TYPE = "UNIFIED"  # Spot o FUTURES
 
-# === CONFIGURAZIONE ENV ===
-BOT_TOKEN     = os.getenv("BOT_TOKEN")
-CHAT_ID       = os.getenv("CHAT_ID", "-4655187396")
-BYBIT_KEY     = os.getenv("BYBIT_API_KEY")
-BYBIT_SECRET  = os.getenv("BYBIT_API_SECRET")
-ORDER_QTY     = float(os.getenv("ORDER_QUANTITY", "0.001"))
+# 2. Parametri Trading
+RISK_PER_TRADE = 0.07  # 7% del capitale per trade
+STOP_LOSS = 0.015     # 1.5%
+TAKE_PROFIT = 0.03    # 3%
+COMMISSION = 0.0008   # 0.06% (VIP 1)
 
-PAIRS         = ["BTCUSD", "XRPUSD", "SOLUSD", "TAOUSD"]
-TIMEFRAME     = "3"      # minuti
-HISTORY_LIMIT = 200      # candele in memoria
-
-# === ISTANZE CLIENT ===
-telegram_bot = Bot(token=BOT_TOKEN)
-bybit        = inverse_perpetual.HTTP(
-    endpoint="https://api.bybit.com",
-    api_key=BYBIT_KEY,
-    api_secret=BYBIT_SECRET
-)
-
-# Stato del bot
-_open_orders = { sym: 0 for sym in PAIRS }
-entry_price  = { sym: None for sym in PAIRS }
-
-def place_order(symbol: str):
-    """Piazza MARKET BUY con leva 8× e notifica Telegram."""
-    if _open_orders[symbol] >= MAX_PYRAMID:
-        logging.info(f"{symbol}: massimo pyramiding ({MAX_PYRAMID}) raggiunto, skip")
+class BybitTradingBot:
+    def __init__(self):
+        self.session = HTTP(
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            testnet=False
+        )
+        self.scaler = StandardScaler()
+        self._init_models()
+        self.equity = self._get_account_balance()
+        
+    def _init_models(self):
+        """Carica modelli pre-addestrati"""
+        # LSTM
+        self.model = Sequential([
+            LSTM(64, input_shape=(60, 7), return_sequences=True),
+            Dropout(0.3),
+            LSTM(32),
+            Dense(1, activation='sigmoid')
+        ])
+        self._load_lstm_weights()
+        
+        # GMM
+        self.gmm = self._load_gmm_model()
+    
+    def _load_lstm_weights(self):
+        """Carica pesi LSTM da stringa base64"""
+        weights_b64 = "h0AAAAA... [truncated] ...QlRoZW4+"
+        weights_bytes = base64.b64decode(weights_b64)
+        with h5py.File(io.BytesIO(weights_bytes), 'r') as f:
+            self.model.set_weights([f['weight'][:] for weight in f.keys()])
+    
+    def _load_gmm_model(self):
+        """Carica GMM da stringa base64"""
+        gmm_b64 = "gASVlQI... [truncated] ...YXVzc2lhbk1peHR1cmWUc2KJlFKUKEsBSwBLAUsCSwN0Yi4="
+        return pickle.loads(base64.b64decode(gmm_b64))
+    
+    def _get_account_balance(self) -> float:
+        """Ottieni il saldo disponibile"""
+        if ACCOUNT_TYPE == "UNIFIED":
+            res = self.session.get_wallet_balance(accountType=ACCOUNT_TYPE, coin="USDT")
+            return float(res['result']['list'][0]['coin'][0]['availableToWithdraw'])
+        else:
+            res = self.session.get_wallet_balance(coin="USDT")
+            return float(res['result']['USDT']['available_balance'])
+    
+    def fetch_ohlcv(self, limit: int = 1000) -> pd.DataFrame:
+        """Ottieni i dati OHLCV più recenti"""
+        res = self.session.get_kline(
+            category="linear" if "FUTURES" in ACCOUNT_TYPE else "spot",
+            symbol=SYMBOL,
+            interval=TIMEFRAME,
+            limit=limit
+        )
+        df = pd.DataFrame(res['result']['list'], columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume'
+        ])
+        df = df.astype({
+            'open': float, 'high': float, 'low': float,
+            'close': float, 'volume': float
+        })
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df.iloc[::-1].reset_index(drop=True)
+    
+    def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Feature engineering completo"""
+        # Features base
+        df['returns'] = df['close'].pct_change()
+        df['volatility'] = df['high'] / df['low'] - 1
+        df['volume_z'] = (df['volume'] - df['volume'].rolling(20).mean()) / df['volume'].rolling(20).std()
+        
+        # Indicatori avanzati
+        df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+        df['obv'] = talib.OBV(df['close'], df['volume'])
+        df['adx'] = talib.ADX(df['high'], df['low'], df['close'], 14)
+        
+        # Normalizzazione
+        features = ['returns', 'volatility', 'volume_z', 'rsi', 'obv', 'adx']
+        df[features] = self.scaler.fit_transform(df[features])
+        
+        return df.dropna()
+    
+    def detect_regime(self, df: pd.DataFrame) -> int:
+        """Classifica regime di mercato"""
+        features = df[['returns', 'volatility', 'volume_z']].values[-100:]
+        return self.gmm.predict(features[-1].reshape(1, -1))[0]
+    
+    def generate_signal(self, df: pd.DataFrame) -> Optional[int]:
+        """Genera segnale di trading"""
+        # Preparazione sequenza LSTM
+        seq = df.iloc[-60:][['open', 'high', 'low', 'close', 'volume', 'rsi', 'obv']].values
+        lstm_prob = self.model.predict(seq.reshape(1, 60, 7))[0][0]
+        
+        # Regole di entrata
+        long_cond = (df['close'].iloc[-1] > df['close'].rolling(50).mean().iloc[-1]) and (lstm_prob > 0.7)
+        short_cond = (df['close'].iloc[-1] < df['close'].rolling(50).mean().iloc[-1]) and (lstm_prob < 0.3)
+        
+        if long_cond:
+            return 1  # LONG
+        elif short_cond:
+            return -1  # SHORT
         return None
-
-    bybit.set_leverage(symbol=symbol, buy_leverage=8, sell_leverage=8)
-    try:
-        resp = bybit.place_active_order(
-            symbol=symbol,
-            side="Buy",
-            order_type="Market",
-            qty=ORDER_QTY,
-            time_in_force="GoodTillCancel"
-        )
-        oid = resp["result"]["order_id"]
-        _open_orders[symbol] += 1
-
-        # Registra il prezzo di entrata
-        pos_info = bybit.get_position(symbol=symbol)["result"][0]
-        entry_price[symbol] = float(pos_info["entry_price"])
-
-        msg = (
-            f"🚀 *Entry Executed*\n"
-            f"Pair: {symbol}\n"
-            f"Qty: {ORDER_QTY}\n"
-            f"Price: {entry_price[symbol]:.2f} USD\n"
-            f"Order ID: `{oid}`\n"
-            f"Pyramiding: {_open_orders[symbol]}/{MAX_PYRAMID}"
-        )
-        telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-        logging.info(f"✅ ENTRY #{_open_orders[symbol]} per {symbol}, order_id {oid}")
-        return oid
-
-    except Exception as e:
-        logging.error(f"❌ Errore entry {symbol}: {e}")
-        telegram_bot.send_message(chat_id=CHAT_ID, text=f"❌ Errore entry {symbol}: {e}")
-        return None
-
-def exit_order(symbol: str):
-    """Piazza MARKET SELL reduce_only e notifica Telegram."""
-    if _open_orders[symbol] == 0:
-        return None
-
-    bybit.set_leverage(symbol=symbol, buy_leverage=8, sell_leverage=8)
-    try:
-        resp = bybit.place_active_order(
-            symbol=symbol,
-            side="Sell",
-            order_type="Market",
-            qty=ORDER_QTY,
-            time_in_force="GoodTillCancel",
-            reduce_only=True
-        )
-        oid = resp["result"]["order_id"]
-        _open_orders[symbol] -= 1
-
-        msg = (
-            f"🏁 *Exit Executed*\n"
-            f"Pair: {symbol}\n"
-            f"Qty: {ORDER_QTY}\n"
-            f"Order ID: `{oid}`\n"
-            f"Pyramiding rimanente: {_open_orders[symbol]}/{MAX_PYRAMID}"
-        )
-        telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-        logging.info(f"✅ EXIT per {symbol}, order_id {oid}")
-        return oid
-
-    except Exception as e:
-        logging.error(f"❌ Errore exit {symbol}: {e}")
-        telegram_bot.send_message(chat_id=CHAT_ID, text=f"❌ Errore exit {symbol}: {e}")
-        return None
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggiunge EMA50, EMA21, EMA34, ATR e ADX."""
-    df["EMA50"] = ta.ema(df["close"], length=50)
-    df["EMA21"] = ta.ema(df["close"], length=21)
-    df["EMA34"] = ta.ema(df["close"], length=34)
-    df["ATR"]   = ta.atr(df["high"], df["low"], df["close"], length=14)
-    df["ADX"]   = ta.adx(df["high"], df["low"], df["close"], length=14)["ADX_14"]
-    return df
-
-def generate_signal(df: pd.DataFrame) -> bool:
-    """Verifica condizione di sweep + filtri EMA50, ADX, ATR."""
-    if len(df) < 3:
-        return False
-    last       = df.iloc[-1]
-    recent_low = df["low"].iloc[-2:].min()
-    prev_high  = df["high"].shift(1).iloc[-2:].max()
-    cond = (
-        (last["low"]  < recent_low) and
-        (last["close"] > recent_low) and
-        (last["close"] > last["EMA50"]) and
-        (last["ADX"]   > 10) and
-        (last["ATR"]   > df["ATR"].rolling(20).mean().iloc[-1])
-    )
-    return bool(cond)
-
-def random_confidence() -> float:
-    return round(random.uniform(85,95),2)
-
-# Rolling storage per ogni pair
-buffers = { sym: deque(maxlen=HISTORY_LIMIT) for sym in PAIRS }
-
-def on_kline(symbol, ts, open_p, high_p, low_p, close_p):
-    buf = buffers[symbol]
-    buf.append({"open": open_p, "high": high_p, "low": low_p, "close": close_p})
-    if len(buf) < HISTORY_LIMIT:
-        return
-
-    df = pd.DataFrame(list(buf))
-    df = calculate_indicators(df)
-    atr = df["ATR"].iloc[-1]
-
-    # ENTRY
-    if _open_orders[symbol] < MAX_PYRAMID and generate_signal(df):
-        oid = place_order(symbol)
-        if oid:
-            conf = random_confidence()
-            logging.info(f"📈 {symbol} LONG (conf {conf}%)")
-
-    # EXIT
-    if _open_orders[symbol] > 0 and entry_price[symbol] is not None:
-        tp = entry_price[symbol] + TAKE_PROFIT_ATR * atr
-        sl = entry_price[symbol] - STOP_LOSS_ATR   * atr
-        reason = None
-        if close_p >= tp:
-            reason = "TP"
-        elif close_p <= sl:
-            reason = "SL"
-
-        if reason:
-            oid = exit_order(symbol)
-            if oid:
-                exit_px = close_p
-                qty     = ORDER_QTY
-                pnl_usd = (exit_px - entry_price[symbol]) * qty
-                eur_rate = requests.get(
-                    "https://api.exchangerate.host/latest?base=USD&symbols=EUR"
-                ).json()["rates"]["EUR"]
-                pnl_eur = pnl_usd * eur_rate
-
-                msg = (
-                    f"🏁 *Trade Closed ({reason})*\n"
-                    f"Pair: {symbol}\n"
-                    f"Entry: {entry_price[symbol]:.2f} USD\n"
-                    f"Exit: {exit_px:.2f} USD\n"
-                    f"PnL: {pnl_usd:.2f} USD / {pnl_eur:.2f} EUR"
-                )
-                telegram_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-                entry_price[symbol] = None
-
-class BybitStreamer:
-    def __init__(self, callback):
-        self.on_kline = callback
-        self.ws = WebSocketApp(
-            "wss://stream.bybit.com/v5/public/inverse",
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close
-        )
-
-    def _on_open(self, ws):
-        args = [f"candle.{TIMEFRAME}.{p}" for p in PAIRS]
-        ws.send(json.dumps({"op":"subscribe","args": args}))
-        logging.info("🔗 WS sottoscritto a: " + ", ".join(args))
-
-    def _on_message(self, ws, msg):
-        m = json.loads(msg)
-        if m.get("topic","").startswith("candle"):
-            for d in m["data"]:
-                k = d["k"]
-                self.on_kline(
-                    symbol=d["symbol"],
-                    ts=k["t"], open_p=float(k["o"]),
-                    high_p=float(k["h"]), low_p=float(k["l"]),
-                    close_p=float(k["c"])
-                )
-
-    def _on_error(self, ws, err):
-        logging.error(f"WS error: {err}")
-
-    def _on_close(self, ws, code, reason):
-        logging.info(f"WS closed: {code} {reason}")
-
-    def start(self):
-        threading.Thread(target=self.ws.run_forever, daemon=True).start()
+    
+    def place_order(self, signal: int):
+        """Esegui ordine con gestione del rischio"""
+        price = self.session.get_tickers(category="linear" if "FUTURES" in ACCOUNT_TYPE else "spot", symbol=SYMBOL)['result']['list'][0]['lastPrice']
+        price = float(price)
+        
+        # Calcola size posizione
+        position_size = (self.equity * RISK_PER_TRADE) / price
+        
+        # Parametri ordine
+        params = {
+            "category": "linear" if "FUTURES" in ACCOUNT_TYPE else "spot",
+            "symbol": SYMBOL,
+            "side": "Buy" if signal == 1 else "Sell",
+            "orderType": "Market",
+            "qty": str(round(position_size, 5)),
+            "timeInForce": "GTC",
+            "stopLoss": str(price * (1 - STOP_LOSS)) if signal == 1 else str(price * (1 + STOP_LOSS)),
+            "takeProfit": str(price * (1 + TAKE_PROFIT)) if signal == 1 else str(price * (1 - TAKE_PROFIT))
+        }
+        
+        # Invia ordine
+        try:
+            response = self.session.place_order(**params)
+            print(f"Ordine eseguito: {response}")
+            return True
+        except Exception as e:
+            print(f"Errore nell'ordine: {e}")
+            return False
+    
+    def run(self):
+        """Esegui il loop di trading"""
+        print(f"Starting bot with ${self.equity:.2f} balance")
+        
+        while True:
+            try:
+                # 1. Ottieni dati
+                df = self.fetch_ohlcv(limit=500)
+                df = self.preprocess_data(df)
+                
+                # 2. Genera segnale
+                signal = self.generate_signal(df)
+                
+                # 3. Esegui trade
+                if signal is not None:
+                    print(f"Segnale generato: {'LONG' if signal == 1 else 'SHORT'}")
+                    self.place_order(signal)
+                
+                # 4. Aggiorna saldo
+                self.equity = self._get_account_balance()
+                print(f"Saldo attuale: ${self.equity:.2f}")
+                
+                # 5. Aspetta il prossimo candle
+                time.sleep(TIMEFRAME * 60 - (time.time() % (TIMEFRAME * 60)))
+                
+            except Exception as e:
+                print(f"Errore: {e}")
+                time.sleep(60)
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
-    )
-    for sym in PAIRS:
-        bybit.set_leverage(sym, buy_leverage=8, sell_leverage=8)
-        logging.info(f"{sym}: leverage 8× impostata")
-
-    streamer = BybitStreamer(on_kline)
-    streamer.start()
-    logging.info("🤖 Bot live su " + ", ".join(PAIRS))
-    while True:
-        time.sleep(60)
+    bot = BybitTradingBot()
+    bot.run()
